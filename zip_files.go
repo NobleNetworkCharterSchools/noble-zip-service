@@ -4,36 +4,30 @@ import (
     "github.com/aws/aws-sdk-go/aws"
     "github.com/aws/aws-sdk-go/aws/session"
     "github.com/aws/aws-sdk-go/service/s3"
+    "github.com/aws/aws-sdk-go/service/s3/s3manager"
 
     "archive/zip"
     "bytes"
     "fmt"
-    "io"
     "os"
     "strings"
     "sync"
     "time"
 )
 
-const objectChunkSize int64 = 10 //50
+const (
+    bufStartSize int = 1024
+    objectBatchSize int64 = 50
+)
 
 func exitErrorf(msg string, args ...interface{}) {
     fmt.Fprintf(os.Stderr, msg+"\n", args...)
     os.Exit(1)
 }
 
-
 func main() {
-	// create some test data
-        /*
-	var inputBuf bytes.Buffer
-	inputBuf.Write([]byte("hello\nsecond text line\n"))
-	fmt.Fprintf(&inputBuf, "written from fmt.Fprintf!\n")
-        */
-
-        // io.Buffer for aws.WriteAtBuffer --> pass ref to addToArchive --> OK?
 	archive := newSyncedArchive("baseDirName")
-	defer archive.archiveFile.Close()
+	defer archive.archiveFile.Close() // defer in main?
 
         bucketName := "nncs-zip-test-bucket"
         keyPrefix := "pdfs"
@@ -43,13 +37,15 @@ func main() {
         )
 
         s3Client := s3.New(sess)
+        downloader := s3manager.NewDownloader(sess)
+
         //s3Client := s3.New(session.New())
         // use s3client.GetBucketLocation to get region from bucket name?
 
         listInput := &s3.ListObjectsV2Input{
             Bucket: aws.String(bucketName),
             Prefix: aws.String(keyPrefix),
-            MaxKeys: aws.Int64(objectChunkSize),
+            MaxKeys: aws.Int64(objectBatchSize),
         }
 
         resultsTruncated := true
@@ -61,29 +57,23 @@ func main() {
             }
 
             for _, item := range resp.Contents {
-                // download file to a buffer and add to archive
-                fmt.Println(*item.Key, *item.Size)
-                //var inputBuf bytes.Buffer
-
-                //downloadBuffer := aws.NewWriteAtBuffer(inputBuf)
-
                 splitKeys := strings.Split(*item.Key, "/")
                 fileName := splitKeys[len(splitKeys)-1]
                 archive.wg.Add(1)
-                go archive.addToArchive(fileName, *item.Key)
+                go archive.addToArchive(fileName, bucketName, *item.Key, downloader)
             }
 
-            //fmt.Printf("IsTruncated (%T): %v\n", *resp.IsTruncated, *resp.IsTruncated)
             resultsCount += len(resp.Contents)
 
-            //resultsTruncated = *resp.IsTruncated
-            resultsTruncated = false // dev
+            resultsTruncated = *resp.IsTruncated
+            //resultsTruncated = false // dev
             listInput.ContinuationToken = resp.NextContinuationToken
+            archive.wg.Wait() // limiting concurrent goroutines
+            fmt.Println("Done processing batch")
         }
 
         fmt.Printf("Found %v items in bucket %q\n", resultsCount, bucketName+"/"+keyPrefix)
 
-	archive.wg.Wait()
 	err := archive.zipWriter.Close()
         if err != nil {
             exitErrorf("Error saving zip archive: %v", err)
@@ -116,29 +106,28 @@ func newSyncedArchive(dirName string) *syncedArchive {
         }
 }
 
-func (a *syncedArchive) addToArchive(fileName, bucket, key string) {
+func (a *syncedArchive) addToArchive(fileName, bucket, key string, downloader *s3manager.Downloader) {
 	defer a.wg.Done()
 
 	// set up header
 	var header zip.FileHeader
 	header.Method = zip.Deflate // for better compression
-	header.Name = fmt.Sprintf("%v/%v", a.dirName, name)
+	header.Name = fmt.Sprintf("%v/%v", a.dirName, fileName)
 	header.Modified = time.Now()
 
-        var data bytes.Buffer
-        downloadBuf := aws.NewWriteAtBuffer(data)
-
-        // ... downloader := s3manager.NewDownloader(sess)
-
+        downloadBuf := aws.NewWriteAtBuffer(make([]byte, bufStartSize))
         numBytes, err := downloader.Download(downloadBuf,
             &s3.GetObjectInput{
                 Bucket: aws.String(bucket),
                 Key: aws.String(key),
-            }
+            },
         )
         if err != nil {
             exitErrorf("Unable to download item %q: %v", key, err)
         }
+        fmt.Println("Downloaded", key, numBytes, "bytes")
+
+        data := bytes.NewBuffer(downloadBuf.Bytes())
 
 	a.Lock()
 	defer a.Unlock()
@@ -148,9 +137,10 @@ func (a *syncedArchive) addToArchive(fileName, bucket, key string) {
         if err != nil {
             exitErrorf("Error creating zip writer handle: %v", err)
         }
-	_, err = data.WriteTo(fileWriter)
+	numBytes, err = data.WriteTo(fileWriter)
         if err != nil {
             exitErrorf("Error saving data to zip archive: %v", err)
         }
+        fmt.Printf("\tWrote %v bytes to zip archive as %q\n", numBytes, fileName)
 }
 
